@@ -1,291 +1,112 @@
+/**
+ * @fileoverview AI Triage & Executive Action Brief synthesis engine.
+ * Re-exports geospatial utilities from `src/utils/geospatial.ts` and applies
+ * input sanitization from `src/utils/security.ts` before invoking Gemini 2.5 Flash.
+ */
+
 import {
   CivicReport,
   ExecutiveActionBrief,
   ReportCategory,
   ReportPriority,
   TriageResult,
-} from '../types';
-import { ACTIVE_CLUSTERS } from '../data/syntheticReports';
+} from '../types/civic';
+import {
+  analyzeSpatialAndSemanticContext,
+  calculateCosineSimilarity,
+  calculateHaversineMeters,
+  parseOrComputeFactorBreakdown,
+  tokenizeAndNormalize,
+} from '../utils/geospatial';
+import { sanitizeInput, validateCoordinates } from '../utils/security';
 
-// ============================================================================
-// 1. GEOSPATIAL HAVERSINE DISTANCE ENGINE (Exact meters)
-// ============================================================================
-export function calculateHaversineMeters(
-  lat1: number,
-  lon1: number,
-  lat2: number,
-  lon2: number
-): number {
-  const R = 6371000; // Earth radius in meters
-  const toRad = (deg: number) => (deg * Math.PI) / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) *
-      Math.cos(toRad(lat2)) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return Math.round(R * c);
-}
-
-// ============================================================================
-// 2. SEMANTIC KEYWORD COSINE SIMILARITY ENGINE
-// ============================================================================
-const STOP_WORDS = new Set([
-  'the', 'and', 'for', 'near', 'with', 'from', 'that', 'this', 'have', 'has',
-  'are', 'was', 'were', 'been', 'into', 'onto', 'right', 'next', 'very', 'just',
-  'road', 'street', 'bengaluru', 'bangalore', 'block', 'main', 'cross', 'area',
-]);
-
-const SYNONYM_MAP: Record<string, string> = {
-  crater: 'pothole',
-  potholes: 'pothole',
-  trench: 'pothole',
-  hole: 'pothole',
-  flooded: 'waterlogging',
-  flood: 'waterlogging',
-  flooding: 'waterlogging',
-  inundated: 'waterlogging',
-  submerged: 'waterlogging',
-  waterlogged: 'waterlogging',
-  sparking: 'sparks',
-  arcing: 'sparks',
-  wires: 'wire',
-  cables: 'wire',
-  cable: 'wire',
-  transformer: 'pole',
-  electric: 'electricity',
-  electrical: 'electricity',
-  garbage: 'waste',
-  trash: 'waste',
-  dump: 'waste',
-  leachate: 'sewage',
-  manhole: 'sewage',
-  drain: 'sewage',
-  sanitary: 'sewage',
+export {
+  analyzeSpatialAndSemanticContext,
+  calculateCosineSimilarity,
+  calculateHaversineMeters,
+  parseOrComputeFactorBreakdown,
+  tokenizeAndNormalize,
 };
 
-function tokenizeAndNormalize(text: string): string[] {
-  return text
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, ' ')
-    .split(/\s+/)
-    .filter((w) => w.length > 2 && !STOP_WORDS.has(w))
-    .map((w) => SYNONYM_MAP[w] || w);
-}
-
-export function calculateCosineSimilarity(textA: string, textB: string): number {
-  const tokensA = tokenizeAndNormalize(textA);
-  const tokensB = tokenizeAndNormalize(textB);
-  if (tokensA.length === 0 || tokensB.length === 0) return 0;
-
-  const freqA: Record<string, number> = {};
-  const freqB: Record<string, number> = {};
-  const vocab = new Set<string>();
-
-  for (const t of tokensA) {
-    freqA[t] = (freqA[t] || 0) + 1;
-    vocab.add(t);
-  }
-  for (const t of tokensB) {
-    freqB[t] = (freqB[t] || 0) + 1;
-    vocab.add(t);
-  }
-
-  let dotProduct = 0;
-  let normA = 0;
-  let normB = 0;
-
-  vocab.forEach((word) => {
-    const a = freqA[word] || 0;
-    const b = freqB[word] || 0;
-    dotProduct += a * b;
-    normA += a * a;
-    normB += b * b;
-  });
-
-  if (normA === 0 || normB === 0) return 0;
-  return Number((dotProduct / (Math.sqrt(normA) * Math.sqrt(normB))).toFixed(2));
-}
-
-// ============================================================================
-// 3. SPATIAL + SEMANTIC DUPLICATE & CLUSTER FINDER (<250m & <300m)
-// ============================================================================
-export interface SpatialMatchAnalysis {
-  duplicateCandidate: CivicReport | null;
-  distanceMeters: number | null;
-  similarityScore: number;
-  detectedClusterId: string | null;
-  nearbyReportsWithin300m: CivicReport[];
-}
-
-export function analyzeSpatialAndSemanticContext(
-  description: string,
-  category: string,
-  latitude: number,
-  longitude: number,
-  existingReports: CivicReport[]
-): SpatialMatchAnalysis {
-  let bestDuplicate: CivicReport | null = null;
-  let bestScore = 0;
-  let bestDist: number | null = null;
-  const nearbyWithin300m: CivicReport[] = [];
-
-  for (const rep of existingReports) {
-    const dist = calculateHaversineMeters(
-      latitude,
-      longitude,
-      rep.latitude,
-      rep.longitude
-    );
-
-    if (dist <= 300) {
-      nearbyWithin300m.push(rep);
-    }
-
-    // Duplicate detection within 250m radius
-    if (dist <= 250 && !rep.duplicate_of) {
-      const textSim = calculateCosineSimilarity(
-        `${category} ${description}`,
-        `${rep.category} ${rep.title} ${rep.description}`
-      );
-      const categoryBonus =
-        rep.category.toLowerCase() === category.toLowerCase() ||
-        rep.ai_category?.toLowerCase() === category.toLowerCase()
-          ? 0.22
-          : 0;
-      const combinedSim = Math.min(0.98, Number((textSim + categoryBonus).toFixed(2)));
-
-      if (combinedSim >= 0.36 && combinedSim > bestScore) {
-        bestScore = combinedSim;
-        bestDuplicate = rep;
-        bestDist = dist;
-      }
-    }
-  }
-
-  // Determine cluster_id: check active clusters within 300m or inherit from nearby reports
-  let detectedClusterId: string | null = null;
-  for (const cluster of ACTIVE_CLUSTERS) {
-    const distToCluster = calculateHaversineMeters(
-      latitude,
-      longitude,
-      cluster.center[0],
-      cluster.center[1]
-    );
-    if (distToCluster <= cluster.radius_m) {
-      detectedClusterId = cluster.cluster_id;
-      break;
-    }
-  }
-
-  if (!detectedClusterId) {
-    const clusterNeighbor = nearbyWithin300m.find((r) => r.cluster_id);
-    if (clusterNeighbor) {
-      detectedClusterId = clusterNeighbor.cluster_id;
-    }
-  }
-
-  return {
-    duplicateCandidate: bestDuplicate,
-    distanceMeters: bestDist,
-    similarityScore: bestScore,
-    detectedClusterId,
-    nearbyReportsWithin300m: nearbyWithin300m,
-  };
-}
-
-// ============================================================================
-// 4. EXPLAINABLE FACTOR BREAKDOWN PARSER & GENERATOR
-// ============================================================================
-export function parseOrComputeFactorBreakdown(report: CivicReport): {
-  safety_risk: number;
-  vulnerable_proximity: number;
-  arterial_traffic_impact: number;
-  compound_cluster_factor: number;
-} {
-  const reasoning = report.ai_reasoning || '';
-  const safetyMatch = reasoning.match(/Safety Risk\s*\((\d+)\/40\)/i);
-  const vulnMatch = reasoning.match(/Vulnerable Proximity\s*\((\d+)\/20\)/i);
-  const trafficMatch = reasoning.match(/Arterial Traffic\s*\((\d+)\/20\)/i);
-  const clusterMatch = reasoning.match(/Compound Cluster\s*\((\d+)\/20\)/i);
-
-  if (safetyMatch && vulnMatch && trafficMatch && clusterMatch) {
-    return {
-      safety_risk: Math.min(40, Number(safetyMatch[1])),
-      vulnerable_proximity: Math.min(20, Number(vulnMatch[1])),
-      arterial_traffic_impact: Math.min(20, Number(trafficMatch[1])),
-      compound_cluster_factor: Math.min(20, Number(clusterMatch[1])),
-    };
-  }
-
-  // Deterministic proportional synthesis summing to ai_priority_score
-  const total = report.ai_priority_score || 70;
-  const hasCluster = Boolean(report.cluster_id);
-  const compound = hasCluster ? Math.min(20, Math.round(total * 0.21)) : Math.min(16, Math.round(total * 0.16));
-  const safety = Math.min(40, Math.round(total * 0.41));
-  const vuln = Math.min(20, Math.round(total * 0.20));
-  const traffic = Math.max(4, Math.min(20, total - (safety + vuln + compound)));
-
-  return {
-    safety_risk: safety,
-    vulnerable_proximity: vuln,
-    arterial_traffic_impact: traffic,
-    compound_cluster_factor: compound,
-  };
-}
-
 const DEPARTMENT_BY_CATEGORY: Record<string, string> = {
-  'Waterlogging': 'BBMP Storm Water Drain (SWD) Cell',
+  Waterlogging: 'BBMP Storm Water Drain (SWD) Cell',
   'Roads & Potholes': 'BBMP Road Infrastructure & Rapid Response',
   'Waste / Garbage': 'Bengaluru Solid Waste Management Ltd (BSWML)',
-  'Streetlights': 'BBMP Electrical Division',
-  'Electricity': 'BESCOM Emergency Vigilance & O&M',
+  Streetlights: 'BBMP Electrical Division',
+  Electricity: 'BESCOM Emergency Vigilance & O&M',
   'Water & Sewage': 'BWSSB Sanitary & Storm Engineering',
   'Public Safety': 'BBMP Disaster Management & Traffic Police',
   'Trees & Parks': 'BBMP Forest Cell & Horticulture',
 };
 
-// ============================================================================
-// 5. DETERMINISTIC HYBRID FALLBACK TRIAGE ALGORITHM
-// ============================================================================
+/**
+ * Executes the deterministic hybrid NLP + Haversine fallback triage algorithm.
+ * Used automatically when the Gemini API key is omitted or rate-limited.
+ */
 export function runDeterministicFallbackTriage(
-  description: string,
+  rawDescription: string,
   userCategory: ReportCategory | string,
-  address: string,
-  latitude: number,
-  longitude: number,
+  rawAddress: string,
+  rawLatitude: number,
+  rawLongitude: number,
   existingReports: CivicReport[]
 ): TriageResult {
+  const description = sanitizeInput(rawDescription, 2000);
+  const address = sanitizeInput(rawAddress, 400);
+  const coords = validateCoordinates(rawLatitude, rawLongitude);
+
   const spatial = analyzeSpatialAndSemanticContext(
     description,
     userCategory,
-    latitude,
-    longitude,
+    coords.latitude,
+    coords.longitude,
     existingReports
   );
 
   const lower = `${description} ${address}`.toLowerCase();
 
-  // Infer AI category
-  let aiCategory = userCategory;
-  if (lower.includes('spark') || lower.includes('transformer') || lower.includes('shock') || lower.includes('bescom')) {
+  let aiCategory: ReportCategory | string = userCategory;
+  if (
+    lower.includes('spark') ||
+    lower.includes('transformer') ||
+    lower.includes('shock') ||
+    lower.includes('bescom') ||
+    lower.includes('live wire')
+  ) {
     aiCategory = 'Electricity';
-  } else if (lower.includes('manhole') || lower.includes('sewage') || lower.includes('bwssb')) {
+  } else if (
+    lower.includes('manhole') ||
+    lower.includes('sewage') ||
+    lower.includes('bwssb')
+  ) {
     aiCategory = 'Water & Sewage';
-  } else if (lower.includes('pothole') || lower.includes('crater') || lower.includes('asphalt')) {
+  } else if (
+    lower.includes('pothole') ||
+    lower.includes('crater') ||
+    lower.includes('asphalt')
+  ) {
     aiCategory = 'Roads & Potholes';
-  } else if (lower.includes('flood') || lower.includes('waterlog') || lower.includes('knee-deep')) {
+  } else if (
+    lower.includes('flood') ||
+    lower.includes('waterlog') ||
+    lower.includes('knee-deep')
+  ) {
     aiCategory = 'Waterlogging';
-  } else if (lower.includes('garbage') || lower.includes('leachate') || lower.includes('waste')) {
+  } else if (
+    lower.includes('garbage') ||
+    lower.includes('leachate') ||
+    lower.includes('waste')
+  ) {
     aiCategory = 'Waste / Garbage';
   }
 
   // Factor 1: Safety Risk (0-40)
   let safety = 22;
-  if (/(spark|live wire|electrocution|open manhole|submerged|crash|skid|fell|ambulance|fire|toxic|sewage)/i.test(lower)) {
+  if (
+    /(spark|live wire|electrocution|open manhole|submerged|crash|skid|fell|ambulance|fire|toxic|sewage)/i.test(
+      lower
+    )
+  ) {
     safety = 38;
   } else if (/(deep|flood|hazard|broken|dark|fallen|hanging)/i.test(lower)) {
     safety = 31;
@@ -293,18 +114,28 @@ export function runDeterministicFallbackTriage(
 
   // Factor 2: Vulnerable Proximity (0-20)
   let vuln = 12;
-  if (/(school|hospital|clinic|bus stand|bus stop|metro|children|senior|pedestrian)/i.test(lower)) {
+  if (
+    /(school|hospital|clinic|bus stand|bus stop|metro|children|senior|pedestrian)/i.test(
+      lower
+    )
+  ) {
     vuln = 19;
   }
 
   // Factor 3: Arterial Traffic Impact (0-20)
   let traffic = 13;
-  if (/(mg road|100ft|80ft|pillar 42|indiranagar|koramangala|hebbal|silk board|whitefield|flyover)/i.test(lower)) {
+  if (
+    /(mg road|100ft|80ft|pillar 42|indiranagar|koramangala|hebbal|silk board|whitefield|flyover)/i.test(
+      lower
+    )
+  ) {
     traffic = 19;
   }
 
   // Factor 4: Compound Cluster Factor (0-20)
-  let compound = spatial.detectedClusterId ? 19 : Math.min(15, 8 + spatial.nearbyReportsWithin300m.length * 2);
+  const compound = spatial.detectedClusterId
+    ? 19
+    : Math.min(15, 8 + spatial.nearbyReportsWithin300m.length * 2);
 
   const totalScore = Math.min(99, Math.max(25, safety + vuln + traffic + compound));
 
@@ -321,9 +152,9 @@ export function runDeterministicFallbackTriage(
       : `${cleanSnippet.slice(0, 65).trim()}...`;
 
   const dupClause = spatial.duplicateCandidate
-    ? ` Semantic & Spatial Duplicate (${spatial.distanceMeters}m from Report #${spatial.duplicateCandidate.id.slice(-4)}, ${Math.round(
-        spatial.similarityScore * 100
-      )}% similarity).`
+    ? ` Semantic & Spatial Duplicate (${spatial.distanceMeters}m from Report #${spatial.duplicateCandidate.id.slice(
+        -4
+      )}, ${Math.round(spatial.similarityScore * 100)}% similarity).`
     : '';
 
   const reasoning = `Safety Risk (${safety}/40): Immediate physical hazard assessment from report telemetry. Vulnerable Proximity (${vuln}/20): Proximity to transit hubs, schools, or clinics. Arterial Traffic (${traffic}/20): Corridor disruption impact. Compound Cluster (${compound}/20): ${
@@ -341,10 +172,13 @@ export function runDeterministicFallbackTriage(
     ai_priority: priority,
     ai_priority_score: totalScore,
     ai_reasoning: reasoning,
-    duplicate_of: spatial.duplicateCandidate ? spatial.duplicateCandidate.id : null,
+    duplicate_of: spatial.duplicateCandidate
+      ? spatial.duplicateCandidate.id
+      : null,
     cluster_id: spatial.detectedClusterId,
     assigned_department:
-      DEPARTMENT_BY_CATEGORY[aiCategory] || 'BBMP Central Command & Rapid Response',
+      DEPARTMENT_BY_CATEGORY[aiCategory] ||
+      'BBMP Central Command & Rapid Response',
     triage_source: 'Deterministic Hybrid Fallback',
     similarity_score: spatial.similarityScore || undefined,
     distance_to_duplicate_m: spatial.distanceMeters ?? undefined,
@@ -357,25 +191,32 @@ export function runDeterministicFallbackTriage(
   };
 }
 
-// Helper: Call Gemini 2.5 Flash first, with automatic backup to gemini-2.0-flash on 404/400, and strip ```json fences
+interface GeminiPart {
+  text?: string;
+  inline_data?: {
+    mime_type: string;
+    data: string;
+  };
+}
+
+/**
+ * Calls `gemini-2.5-flash` first with automatic backup to `gemini-2.0-flash` on 404/400,
+ * stripping any markdown ` ```json ` fences before parsing.
+ */
 async function callGeminiWithBackupAndCleanJson(
   apiKey: string,
-  parts: any[],
+  parts: GeminiPart[],
   temperature = 0.15
-): Promise<any | null> {
+): Promise<Record<string, unknown> | null> {
   const cleanKey = apiKey.trim();
   const models = ['gemini-2.5-flash', 'gemini-2.0-flash'];
 
   for (const model of models) {
     try {
       const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${cleanKey}`;
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 8000);
-
       const response = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
         body: JSON.stringify({
           contents: [{ parts }],
           generationConfig: {
@@ -384,18 +225,20 @@ async function callGeminiWithBackupAndCleanJson(
           },
         }),
       });
-      clearTimeout(timeoutId);
 
       if (!response.ok) {
         if (response.status === 404 || response.status === 400) {
-          continue; // Try backup model
+          continue;
         }
         return null;
       }
 
-      const resultJson = await response.json();
-      const rawText: string | undefined =
-        resultJson?.candidates?.[0]?.content?.parts?.[0]?.text;
+      const resultJson = (await response.json()) as {
+        candidates?: Array<{
+          content?: { parts?: Array<{ text?: string }> };
+        }>;
+      };
+      const rawText = resultJson?.candidates?.[0]?.content?.parts?.[0]?.text;
       if (!rawText) continue;
 
       const cleanedText = rawText
@@ -403,7 +246,7 @@ async function callGeminiWithBackupAndCleanJson(
         .replace(/\s*```$/i, '')
         .trim();
 
-      return JSON.parse(cleanedText);
+      return JSON.parse(cleanedText) as Record<string, unknown>;
     } catch (err) {
       console.warn(`Gemini model ${model} attempt failed:`, err);
     }
@@ -411,9 +254,10 @@ async function callGeminiWithBackupAndCleanJson(
   return null;
 }
 
-// ============================================================================
-// 6. LIVE GEMINI 2.5 FLASH MULTIMODAL / JSON TRIAGE PIPELINE
-// ============================================================================
+/**
+ * Runs the full Gemini 2.5 Flash multimodal/JSON triage pipeline with automatic
+ * Haversine spatial context injection and deterministic hybrid fallback.
+ */
 export async function runGeminiTriagePipeline(params: {
   description: string;
   category: ReportCategory | string;
@@ -424,22 +268,17 @@ export async function runGeminiTriagePipeline(params: {
   existingReports: CivicReport[];
   geminiApiKey: string;
 }): Promise<TriageResult> {
-  const {
-    description,
-    category,
-    address,
-    latitude,
-    longitude,
-    imageBase64OrUrl,
-    existingReports,
-    geminiApiKey,
-  } = params;
+  const description = sanitizeInput(params.description, 2000);
+  const category = sanitizeInput(String(params.category), 100);
+  const address = sanitizeInput(params.address, 400);
+  const coords = validateCoordinates(params.latitude, params.longitude);
+  const { imageBase64OrUrl, existingReports, geminiApiKey } = params;
 
   const spatial = analyzeSpatialAndSemanticContext(
     description,
     category,
-    latitude,
-    longitude,
+    coords.latitude,
+    coords.longitude,
     existingReports
   );
 
@@ -447,8 +286,8 @@ export async function runGeminiTriagePipeline(params: {
     description,
     category,
     address,
-    latitude,
-    longitude,
+    coords.latitude,
+    coords.longitude,
     existingReports
   );
 
@@ -457,14 +296,21 @@ export async function runGeminiTriagePipeline(params: {
   }
 
   try {
-    const nearbyContextJson = spatial.nearbyReportsWithin300m.slice(0, 8).map((r) => ({
-      id: r.id,
-      title: r.title,
-      category: r.category,
-      distance_meters: calculateHaversineMeters(latitude, longitude, r.latitude, r.longitude),
-      cluster_id: r.cluster_id,
-      priority_score: r.ai_priority_score,
-    }));
+    const nearbyContextJson = spatial.nearbyReportsWithin300m
+      .slice(0, 8)
+      .map((r) => ({
+        id: r.id,
+        title: r.title,
+        category: r.category,
+        distance_meters: calculateHaversineMeters(
+          coords.latitude,
+          coords.longitude,
+          r.latitude,
+          r.longitude
+        ),
+        cluster_id: r.cluster_id,
+        priority_score: r.ai_priority_score,
+      }));
 
     const promptText = `You are CivicPulse AI, Bengaluru's Municipal Decision-Intelligence Triage Engine.
 Analyze this incoming citizen complaint and nearby reports within 300m from Supabase.
@@ -472,7 +318,7 @@ Analyze this incoming citizen complaint and nearby reports within 300m from Supa
 NEW CITIZEN REPORT:
 - User Category: "${category}"
 - Description: "${description}"
-- Location Address: "${address}" (Lat: ${latitude}, Lng: ${longitude})
+- Location Address: "${address}" (Lat: ${coords.latitude}, Lng: ${coords.longitude})
 - Pre-computed Spatial Duplicate Candidate (<250m): ${
       spatial.duplicateCandidate
         ? JSON.stringify({
@@ -503,11 +349,12 @@ Return ONLY valid JSON with these exact keys:
   "assigned_department": "Specific Bengaluru agency (e.g., BESCOM Emergency Vigilance, BBMP SWD Cell, BWSSB Sanitary Engineering, BSWML)"
 }`;
 
-    const parts: any[] = [{ text: promptText }];
+    const parts: GeminiPart[] = [{ text: promptText }];
 
-    // Pass base64 image to Gemini Vision if uploaded as data URL
     if (imageBase64OrUrl && imageBase64OrUrl.startsWith('data:image/')) {
-      const match = imageBase64OrUrl.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,(.+)$/);
+      const match = imageBase64OrUrl.match(
+        /^data:(image\/[a-zA-Z0-9+.-]+);base64,(.+)$/
+      );
       if (match) {
         parts.push({
           inline_data: {
@@ -518,31 +365,86 @@ Return ONLY valid JSON with these exact keys:
       }
     }
 
-    const parsed = await callGeminiWithBackupAndCleanJson(geminiApiKey, parts, 0.15);
+    const parsed = await callGeminiWithBackupAndCleanJson(
+      geminiApiKey,
+      parts,
+      0.15
+    );
     if (!parsed) {
       return fallbackResult;
     }
 
-    const safety = Math.min(40, Math.max(0, Number(parsed.safety_risk ?? fallbackResult.factor_breakdown.safety_risk)));
-    const vuln = Math.min(20, Math.max(0, Number(parsed.vulnerable_proximity ?? fallbackResult.factor_breakdown.vulnerable_proximity)));
-    const traffic = Math.min(20, Math.max(0, Number(parsed.arterial_traffic_impact ?? fallbackResult.factor_breakdown.arterial_traffic_impact)));
-    const compound = Math.min(20, Math.max(0, Number(parsed.compound_cluster_factor ?? fallbackResult.factor_breakdown.compound_cluster_factor)));
-    const score = Math.min(100, Math.max(10, Number(parsed.ai_priority_score || safety + vuln + traffic + compound)));
+    const safety = Math.min(
+      40,
+      Math.max(
+        0,
+        Number(parsed.safety_risk ?? fallbackResult.factor_breakdown.safety_risk)
+      )
+    );
+    const vuln = Math.min(
+      20,
+      Math.max(
+        0,
+        Number(
+          parsed.vulnerable_proximity ??
+            fallbackResult.factor_breakdown.vulnerable_proximity
+        )
+      )
+    );
+    const traffic = Math.min(
+      20,
+      Math.max(
+        0,
+        Number(
+          parsed.arterial_traffic_impact ??
+            fallbackResult.factor_breakdown.arterial_traffic_impact
+        )
+      )
+    );
+    const compound = Math.min(
+      20,
+      Math.max(
+        0,
+        Number(
+          parsed.compound_cluster_factor ??
+            fallbackResult.factor_breakdown.compound_cluster_factor
+        )
+      )
+    );
+    const score = Math.min(
+      100,
+      Math.max(
+        10,
+        Number(parsed.ai_priority_score || safety + vuln + traffic + compound)
+      )
+    );
+
+    const parsedPriority = String(parsed.ai_priority || '');
 
     return {
-      title: parsed.title || fallbackResult.title,
-      ai_category: parsed.ai_category || fallbackResult.ai_category,
-      ai_summary: parsed.ai_summary || fallbackResult.ai_summary,
-      ai_priority: (['Critical', 'High', 'Medium', 'Low'].includes(parsed.ai_priority)
-        ? parsed.ai_priority
+      title: String(parsed.title || fallbackResult.title),
+      ai_category: String(parsed.ai_category || fallbackResult.ai_category),
+      ai_summary: String(parsed.ai_summary || fallbackResult.ai_summary),
+      ai_priority: (['Critical', 'High', 'Medium', 'Low'].includes(
+        parsedPriority
+      )
+        ? parsedPriority
         : fallbackResult.ai_priority) as ReportPriority,
       ai_priority_score: score,
-      ai_reasoning: parsed.ai_reasoning || fallbackResult.ai_reasoning,
+      ai_reasoning: String(parsed.ai_reasoning || fallbackResult.ai_reasoning),
       duplicate_of:
-        parsed.duplicate_of ||
-        (spatial.duplicateCandidate ? spatial.duplicateCandidate.id : null),
-      cluster_id: parsed.cluster_id || spatial.detectedClusterId,
-      assigned_department: parsed.assigned_department || fallbackResult.assigned_department,
+        typeof parsed.duplicate_of === 'string' && parsed.duplicate_of.length > 5
+          ? parsed.duplicate_of
+          : spatial.duplicateCandidate
+          ? spatial.duplicateCandidate.id
+          : null,
+      cluster_id:
+        typeof parsed.cluster_id === 'string' && parsed.cluster_id !== 'null'
+          ? parsed.cluster_id
+          : spatial.detectedClusterId,
+      assigned_department: String(
+        parsed.assigned_department || fallbackResult.assigned_department
+      ),
       triage_source: 'Live Gemini 2.5 Flash API',
       similarity_score: spatial.similarityScore || undefined,
       distance_to_duplicate_m: spatial.distanceMeters ?? undefined,
@@ -559,10 +461,13 @@ Return ONLY valid JSON with these exact keys:
   }
 }
 
-// ============================================================================
-// 7. 60-SECOND EXECUTIVE ACTION BRIEF GENERATOR (CLUSTER OR CITY-WIDE)
-// ============================================================================
-const FALLBACK_ACTION_BRIEFS: Record<string, Omit<ExecutiveActionBrief, 'generated_at' | 'source' | 'total_reports_analyzed' | 'compound_severity_score'>> = {
+const FALLBACK_ACTION_BRIEFS: Record<
+  string,
+  Omit<
+    ExecutiveActionBrief,
+    'generated_at' | 'source' | 'total_reports_analyzed' | 'compound_severity_score'
+  >
+> = {
   'CLUSTER-MG-DRAIN': {
     target_id: 'CLUSTER-MG-DRAIN',
     target_name: 'MG Road Pillar 42 Compound Flood & Crater Crisis',
@@ -629,8 +534,11 @@ const FALLBACK_ACTION_BRIEFS: Record<string, Omit<ExecutiveActionBrief, 'generat
   },
 };
 
+/**
+ * Generates a 60-Second Executive Action Brief across an active geographic cluster or city-wide.
+ */
 export async function generateExecutiveActionBrief(params: {
-  targetId: string; // 'CLUSTER-MG-DRAIN' | 'CLUSTER-IND-POWER' | 'CLUSTER-KOR-WASTE' | 'CITY-OVERALL'
+  targetId: string;
   reports: CivicReport[];
   geminiApiKey: string;
 }): Promise<ExecutiveActionBrief> {
@@ -644,8 +552,10 @@ export async function generateExecutiveActionBrief(params: {
   const avgScore =
     relevantReports.length > 0
       ? Math.round(
-          relevantReports.reduce((acc, r) => acc + (r.ai_priority_score || 75), 0) /
-            relevantReports.length
+          relevantReports.reduce(
+            (acc, r) => acc + (r.ai_priority_score || 75),
+            0
+          ) / relevantReports.length
         )
       : 88;
 
@@ -654,7 +564,11 @@ export async function generateExecutiveActionBrief(params: {
 
   const fallbackBrief: ExecutiveActionBrief = {
     ...preset,
-    generated_at: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+    generated_at: new Date().toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    }),
     source: 'Deterministic Hybrid Fallback',
     total_reports_analyzed: relevantReports.length,
     compound_severity_score: Math.min(99, avgScore + 5),
@@ -699,17 +613,24 @@ Return ONLY valid JSON with these exact keys:
     return {
       target_id: targetId,
       target_name: preset.target_name,
-      generated_at: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      generated_at: new Date().toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      }),
       source: 'Live Gemini 2.5 Flash API',
-      root_cause_hypothesis:
-        parsed.root_cause_hypothesis || fallbackBrief.root_cause_hypothesis,
-      immediate_first_response:
-        parsed.immediate_first_response || fallbackBrief.immediate_first_response,
+      root_cause_hypothesis: String(
+        parsed.root_cause_hypothesis || fallbackBrief.root_cause_hypothesis
+      ),
+      immediate_first_response: String(
+        parsed.immediate_first_response || fallbackBrief.immediate_first_response
+      ),
       departments_to_coordinate: Array.isArray(parsed.departments_to_coordinate)
-        ? parsed.departments_to_coordinate
+        ? (parsed.departments_to_coordinate as string[]).map(String)
         : fallbackBrief.departments_to_coordinate,
-      risk_if_ignored_24h:
-        parsed.risk_if_ignored_24h || fallbackBrief.risk_if_ignored_24h,
+      risk_if_ignored_24h: String(
+        parsed.risk_if_ignored_24h || fallbackBrief.risk_if_ignored_24h
+      ),
       total_reports_analyzed: relevantReports.length,
       compound_severity_score: Math.min(99, avgScore + 5),
     };
@@ -718,4 +639,3 @@ Return ONLY valid JSON with these exact keys:
     return fallbackBrief;
   }
 }
-

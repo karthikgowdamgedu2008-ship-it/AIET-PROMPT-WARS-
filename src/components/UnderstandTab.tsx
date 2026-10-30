@@ -13,11 +13,11 @@ import {
   ExternalLink,
   ArrowUpRight,
 } from 'lucide-react';
-import { ApiConfig, CivicReport } from '../types';
+import { ApiConfig, CivicReport } from '../types/civic';
 import {
   calculateHaversineMeters,
   parseOrComputeFactorBreakdown,
-} from '../services/aiTriageEngine';
+} from '../utils/geospatial';
 import { updateReportInDb } from '../services/supabaseClient';
 
 interface UnderstandTabProps {
@@ -53,13 +53,15 @@ export const UnderstandTab: React.FC<UnderstandTabProps> = ({
           r.description.toLowerCase().includes(q) ||
           r.address.toLowerCase().includes(q) ||
           r.category.toLowerCase().includes(q) ||
-          (r.cluster_id && r.cluster_id.toLowerCase().includes(q))
+          Boolean(r.cluster_id && r.cluster_id.toLowerCase().includes(q))
         );
       }
       return true;
     });
 
-  const handleConfirmMergeAndBoost = async (childReport: CivicReport) => {
+  const handleConfirmMergeAndBoost = async (
+    childReport: CivicReport
+  ): Promise<void> => {
     if (!childReport.duplicate_of) return;
     const parentReport = reports.find((r) => r.id === childReport.duplicate_of);
     if (!parentReport) return;
@@ -67,9 +69,16 @@ export const UnderstandTab: React.FC<UnderstandTabProps> = ({
     setMergingId(childReport.id);
 
     const boostedScore = Math.min(100, (parentReport.ai_priority_score || 85) + 3);
-    const boostedPriority = boostedScore >= 88 ? 'Critical' : parentReport.ai_priority;
-    const updatedParentReasoning = `${parentReport.ai_reasoning || ''} [Merged +Corroborated with Duplicate Report #${childReport.id.slice(-4)} → Priority Score boosted to ${boostedScore}/100]`;
-    const updatedChildNotes = `Confirmed Duplicate Merge into Parent Ticket #${parentReport.id.slice(-4)} by Decision-Maker. Parent priority boosted to ${boostedScore}/100.`;
+    const boostedPriority =
+      boostedScore >= 88 ? 'Critical' : parentReport.ai_priority;
+    const updatedParentReasoning = `${
+      parentReport.ai_reasoning || ''
+    } [Merged +Corroborated with Duplicate Report #${childReport.id.slice(
+      -4
+    )} → Priority Score boosted to ${boostedScore}/100]`;
+    const updatedChildNotes = `Confirmed Duplicate Merge into Parent Ticket #${parentReport.id.slice(
+      -4
+    )} by Decision-Maker. Parent priority boosted to ${boostedScore}/100.`;
 
     await updateReportInDb(
       parentReport.id,
@@ -114,7 +123,7 @@ export const UnderstandTab: React.FC<UnderstandTabProps> = ({
     setMergingId(null);
   };
 
-  const scrollToReportCard = (targetId: string) => {
+  const scrollToReportCard = (targetId: string): void => {
     const el = document.getElementById(`report-card-${targetId}`);
     if (el) {
       el.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -124,66 +133,98 @@ export const UnderstandTab: React.FC<UnderstandTabProps> = ({
   const duplicateCount = reports.filter((r) => r.duplicate_of !== null).length;
 
   return (
-    <div className="space-y-6">
+    <section
+      aria-labelledby="understand-section-heading"
+      className="space-y-6"
+    >
       {/* Header & Controls */}
       <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4 rounded-2xl border border-slate-800 bg-slate-900/80 p-5">
         <div className="space-y-1">
           <div className="flex items-center gap-2">
-            <BrainCircuit className="h-5 w-5 text-cyan-400" />
-            <h2 className="text-lg font-bold text-white">
+            <BrainCircuit
+              className="h-5 w-5 text-cyan-400"
+              aria-hidden="true"
+            />
+            <h2
+              id="understand-section-heading"
+              className="text-lg font-bold text-white"
+            >
               Explainable AI Triage & Semantic Duplicate Inspector
             </h2>
             <span className="rounded-full bg-cyan-500/15 px-2.5 py-0.5 text-xs font-mono text-cyan-300 border border-cyan-500/30">
               Ordered by ai_priority_score DESC
             </span>
           </div>
-          <p className="text-xs text-slate-400">
-            Every ticket’s priority score (0–100) is decomposed into 4 transparent civic risk pillars so decision-makers see <span className="text-slate-200 font-medium">why</span> one issue outranks another.
+          <p className="text-xs text-slate-300">
+            Every ticket’s priority score (0–100) is decomposed into 4 transparent civic risk pillars so decision-makers see{' '}
+            <span className="text-white font-medium">why</span> one issue outranks another.
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5">
           <div className="relative">
-            <Search className="h-4 w-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+            <label htmlFor="understand-search-input" className="sr-only">
+              Search reports by address, pillar, or cluster
+            </label>
+            <Search
+              className="h-4 w-4 text-slate-300 absolute left-3 top-1/2 -translate-y-1/2"
+              aria-hidden="true"
+            />
             <input
+              id="understand-search-input"
               type="text"
+              aria-required="false"
+              aria-describedby="understand-search-help"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="Search address, pillar, cluster..."
-              className="rounded-xl border border-slate-700 bg-slate-950 pl-9 pr-3.5 py-2 text-xs text-slate-200 placeholder-slate-500 focus:border-cyan-500 focus:outline-none"
+              className="rounded-xl border border-slate-700 bg-slate-950 pl-9 pr-3.5 py-2 text-xs text-slate-200 placeholder-slate-400 focus:border-cyan-500 focus:outline-none"
             />
+            <span id="understand-search-help" className="sr-only">
+              Filter triaged reports by keyword, road name, or cluster identifier
+            </span>
           </div>
 
-          <div className="flex rounded-xl border border-slate-800 bg-slate-950 p-1 text-xs font-semibold">
+          <div
+            role="group"
+            aria-label="Filter reports by duplicate or priority status"
+            className="flex rounded-xl border border-slate-800 bg-slate-950 p-1 text-xs font-semibold"
+          >
             <button
               type="button"
+              aria-pressed={filterMode === 'ALL'}
+              aria-label={`Show all ${reports.length} reports`}
               onClick={() => setFilterMode('ALL')}
               className={`rounded-lg px-3 py-1.5 transition ${
                 filterMode === 'ALL'
                   ? 'bg-cyan-500/20 text-cyan-300'
-                  : 'text-slate-400 hover:text-slate-200'
+                  : 'text-slate-300 hover:text-white'
               }`}
             >
               All ({reports.length})
             </button>
             <button
               type="button"
+              aria-pressed={filterMode === 'CRITICAL'}
+              aria-label="Show Critical priority reports only"
               onClick={() => setFilterMode('CRITICAL')}
               className={`rounded-lg px-3 py-1.5 transition ${
                 filterMode === 'CRITICAL'
                   ? 'bg-red-500/20 text-red-300'
-                  : 'text-slate-400 hover:text-slate-200'
+                  : 'text-slate-300 hover:text-white'
               }`}
             >
               Critical Only
             </button>
             <button
               type="button"
+              aria-pressed={filterMode === 'DUPLICATES'}
+              aria-label={`Show ${duplicateCount} duplicate reports`}
               onClick={() => setFilterMode('DUPLICATES')}
               className={`rounded-lg px-3 py-1.5 transition ${
                 filterMode === 'DUPLICATES'
                   ? 'bg-amber-500/20 text-amber-300'
-                  : 'text-slate-400 hover:text-slate-200'
+                  : 'text-slate-300 hover:text-white'
               }`}
             >
               Duplicates ({duplicateCount})
@@ -199,26 +240,28 @@ export const UnderstandTab: React.FC<UnderstandTabProps> = ({
           const parentReport = report.duplicate_of
             ? reports.find((r) => r.id === report.duplicate_of)
             : null;
-          const distMeters =
-            parentReport
-              ? calculateHaversineMeters(
-                  report.latitude,
-                  report.longitude,
-                  parentReport.latitude,
-                  parentReport.longitude
-                )
-              : report.distance_to_duplicate_m || 15;
+          const distMeters = parentReport
+            ? calculateHaversineMeters(
+                report.latitude,
+                report.longitude,
+                parentReport.latitude,
+                parentReport.longitude
+              )
+            : report.distance_to_duplicate_m || 15;
 
           const isHighlighted = highlightedReportId === report.id;
           const isMerged =
             mergedIds[report.id] ||
-            (report.duplicate_of &&
-              report.resolution_notes?.includes('Confirmed Duplicate Merge'));
+            Boolean(
+              report.duplicate_of &&
+                report.resolution_notes?.includes('Confirmed Duplicate Merge')
+            );
 
           return (
-            <div
+            <article
               id={`report-card-${report.id}`}
               key={report.id}
+              aria-label={`Rank ${index + 1}: ${report.title}`}
               className={`rounded-2xl border transition p-5 ${
                 isHighlighted
                   ? 'border-cyan-400 bg-cyan-950/20 ring-2 ring-cyan-500/40'
@@ -231,10 +274,10 @@ export const UnderstandTab: React.FC<UnderstandTabProps> = ({
                 {/* Left Info */}
                 <div className="space-y-2.5 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className="rounded-lg bg-slate-800 px-2 py-0.5 text-xs font-mono font-bold text-slate-300">
+                    <span className="rounded-lg bg-slate-800 px-2 py-0.5 text-xs font-mono font-bold text-slate-200">
                       Rank #{index + 1}
                     </span>
-                    <span className="rounded-lg bg-slate-950 px-2 py-0.5 text-[11px] font-mono text-slate-400 border border-slate-800">
+                    <span className="rounded-lg bg-slate-950 px-2 py-0.5 text-[11px] font-mono text-slate-300 border border-slate-800">
                       ID: #{report.id.slice(-6)}
                     </span>
                     <span className="rounded-full bg-cyan-500/15 px-2.5 py-0.5 text-xs font-semibold text-cyan-300 border border-cyan-500/30">
@@ -244,12 +287,13 @@ export const UnderstandTab: React.FC<UnderstandTabProps> = ({
                     {report.cluster_id && (
                       <button
                         type="button"
+                        aria-label={`Inspect cluster ${report.cluster_id} on Reveal Map`}
                         onClick={() => onNavigateToClusterMap(report.cluster_id)}
                         className="inline-flex items-center gap-1 rounded-full bg-red-500/15 px-2.5 py-0.5 text-xs font-mono font-semibold text-red-300 border border-red-500/30 hover:bg-red-500/25 transition"
                       >
-                        <Layers className="h-3 w-3" />
+                        <Layers className="h-3 w-3" aria-hidden="true" />
                         {report.cluster_id}
-                        <ArrowUpRight className="h-3 w-3" />
+                        <ArrowUpRight className="h-3 w-3" aria-hidden="true" />
                       </button>
                     )}
 
@@ -257,44 +301,61 @@ export const UnderstandTab: React.FC<UnderstandTabProps> = ({
                     {report.duplicate_of && (
                       <button
                         type="button"
+                        aria-label={`Jump to parent report ${report.duplicate_of.slice(-4)}`}
                         onClick={() => scrollToReportCard(report.duplicate_of!)}
                         className="inline-flex items-center gap-1.5 rounded-full bg-amber-500/20 px-3 py-0.5 text-xs font-bold text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 transition"
                       >
-                        <AlertTriangle className="h-3.5 w-3.5 text-amber-400" />
+                        <AlertTriangle
+                          className="h-3.5 w-3.5 text-amber-400"
+                          aria-hidden="true"
+                        />
                         Likely Duplicate Detected → Parent #{report.duplicate_of.slice(-4)} ({distMeters}m away)
                       </button>
                     )}
 
                     {report.triage_source && (
-                      <span className="inline-flex items-center gap-1 rounded-full bg-slate-800/90 px-2.5 py-0.5 text-[11px] text-slate-300">
-                        <Sparkles className="h-3 w-3 text-cyan-400" />
+                      <span className="inline-flex items-center gap-1 rounded-full bg-slate-800/90 px-2.5 py-0.5 text-[11px] text-slate-200">
+                        <Sparkles
+                          className="h-3 w-3 text-cyan-400"
+                          aria-hidden="true"
+                        />
                         {report.triage_source}
                       </span>
                     )}
                   </div>
 
                   <h3 className="text-base font-bold text-white">{report.title}</h3>
-                  <p className="text-xs text-slate-300 leading-relaxed">
+                  <p className="text-xs text-slate-200 leading-relaxed">
                     {report.description}
                   </p>
 
                   {report.ai_summary && (
                     <div className="rounded-xl border border-slate-800 bg-slate-950/70 px-3.5 py-2 text-xs text-cyan-200">
-                      <span className="font-bold text-cyan-400">AI Executive Summary: </span>
+                      <span className="font-bold text-cyan-300">
+                        AI Executive Summary:{' '}
+                      </span>
                       {report.ai_summary}
                     </div>
                   )}
 
-                  <div className="flex flex-wrap items-center gap-4 text-[11px] text-slate-400 pt-1">
+                  <div className="flex flex-wrap items-center gap-4 text-[11px] text-slate-300 pt-1">
                     <span>📍 {report.address}</span>
-                    <span>🏛️ Assigned: <strong className="text-slate-200">{report.assigned_department || 'Unassigned'}</strong></span>
-                    <span>📌 Status: <strong className="text-cyan-300">{report.status}</strong></span>
+                    <span>
+                      🏛️ Assigned:{' '}
+                      <strong className="text-slate-100">
+                        {report.assigned_department || 'Unassigned'}
+                      </strong>
+                    </span>
+                    <span>
+                      📌 Status:{' '}
+                      <strong className="text-cyan-300">{report.status}</strong>
+                    </span>
                   </div>
                 </div>
 
                 {/* Right Score Badge */}
                 <div className="flex lg:flex-col items-center justify-between lg:justify-center rounded-2xl border border-slate-800 bg-slate-950 px-5 py-3.5 shrink-0 min-w-[145px]">
-                  <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-300">
                     AI Priority Score
                   </div>
                   <div
@@ -309,7 +370,9 @@ export const UnderstandTab: React.FC<UnderstandTabProps> = ({
                     }`}
                   >
                     {report.ai_priority_score}
-                    <span className="text-xs font-normal text-slate-500">/100</span>
+                    <span className="text-xs font-normal text-slate-300">
+                      /100
+                    </span>
                   </div>
                   <span
                     className={`rounded-full px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${
@@ -329,10 +392,14 @@ export const UnderstandTab: React.FC<UnderstandTabProps> = ({
 
               {/* Explainable Prioritization Breakdown (4 Pillars) */}
               <div className="mt-4 pt-4 border-t border-slate-800/90 space-y-3">
-                <div className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center justify-between">
-                  <span>Why This Report Outranks Others (Explainable 4-Factor Breakdown)</span>
-                  <span className="text-[11px] font-mono text-slate-400">
-                    {factors.safety_risk} + {factors.vulnerable_proximity} + {factors.arterial_traffic_impact} + {factors.compound_cluster_factor} = {report.ai_priority_score}/100
+                <div className="text-xs font-bold uppercase tracking-wider text-slate-200 flex items-center justify-between">
+                  <span>
+                    Why This Report Outranks Others (Explainable 4-Factor Breakdown)
+                  </span>
+                  <span className="text-[11px] font-mono text-slate-300">
+                    {factors.safety_risk} + {factors.vulnerable_proximity} +{' '}
+                    {factors.arterial_traffic_impact} +{' '}
+                    {factors.compound_cluster_factor} = {report.ai_priority_score}/100
                   </span>
                 </div>
 
@@ -341,10 +408,15 @@ export const UnderstandTab: React.FC<UnderstandTabProps> = ({
                   <div className="rounded-xl border border-slate-800 bg-slate-950/80 p-3">
                     <div className="flex items-center justify-between text-xs font-semibold text-slate-200">
                       <span className="flex items-center gap-1.5">
-                        <ShieldAlert className="h-3.5 w-3.5 text-red-400" />
+                        <ShieldAlert
+                          className="h-3.5 w-3.5 text-red-400"
+                          aria-hidden="true"
+                        />
                         Safety Risk
                       </span>
-                      <span className="font-mono text-red-300">{factors.safety_risk}/40</span>
+                      <span className="font-mono text-red-300">
+                        {factors.safety_risk}/40
+                      </span>
                     </div>
                     <div className="mt-2 h-1.5 w-full rounded-full bg-slate-800 overflow-hidden">
                       <div
@@ -358,15 +430,22 @@ export const UnderstandTab: React.FC<UnderstandTabProps> = ({
                   <div className="rounded-xl border border-slate-800 bg-slate-950/80 p-3">
                     <div className="flex items-center justify-between text-xs font-semibold text-slate-200">
                       <span className="flex items-center gap-1.5">
-                        <Hospital className="h-3.5 w-3.5 text-amber-400" />
+                        <Hospital
+                          className="h-3.5 w-3.5 text-amber-400"
+                          aria-hidden="true"
+                        />
                         Schools / Clinics
                       </span>
-                      <span className="font-mono text-amber-300">{factors.vulnerable_proximity}/20</span>
+                      <span className="font-mono text-amber-300">
+                        {factors.vulnerable_proximity}/20
+                      </span>
                     </div>
                     <div className="mt-2 h-1.5 w-full rounded-full bg-slate-800 overflow-hidden">
                       <div
                         className="h-full bg-amber-400 rounded-full"
-                        style={{ width: `${(factors.vulnerable_proximity / 20) * 100}%` }}
+                        style={{
+                          width: `${(factors.vulnerable_proximity / 20) * 100}%`,
+                        }}
                       />
                     </div>
                   </div>
@@ -375,15 +454,22 @@ export const UnderstandTab: React.FC<UnderstandTabProps> = ({
                   <div className="rounded-xl border border-slate-800 bg-slate-950/80 p-3">
                     <div className="flex items-center justify-between text-xs font-semibold text-slate-200">
                       <span className="flex items-center gap-1.5">
-                        <Car className="h-3.5 w-3.5 text-cyan-400" />
+                        <Car
+                          className="h-3.5 w-3.5 text-cyan-400"
+                          aria-hidden="true"
+                        />
                         Arterial Traffic
                       </span>
-                      <span className="font-mono text-cyan-300">{factors.arterial_traffic_impact}/20</span>
+                      <span className="font-mono text-cyan-300">
+                        {factors.arterial_traffic_impact}/20
+                      </span>
                     </div>
                     <div className="mt-2 h-1.5 w-full rounded-full bg-slate-800 overflow-hidden">
                       <div
                         className="h-full bg-cyan-400 rounded-full"
-                        style={{ width: `${(factors.arterial_traffic_impact / 20) * 100}%` }}
+                        style={{
+                          width: `${(factors.arterial_traffic_impact / 20) * 100}%`,
+                        }}
                       />
                     </div>
                   </div>
@@ -392,67 +478,94 @@ export const UnderstandTab: React.FC<UnderstandTabProps> = ({
                   <div className="rounded-xl border border-slate-800 bg-slate-950/80 p-3">
                     <div className="flex items-center justify-between text-xs font-semibold text-slate-200">
                       <span className="flex items-center gap-1.5">
-                        <Layers className="h-3.5 w-3.5 text-purple-400" />
+                        <Layers
+                          className="h-3.5 w-3.5 text-purple-400"
+                          aria-hidden="true"
+                        />
                         Compound Cluster
                       </span>
-                      <span className="font-mono text-purple-300">{factors.compound_cluster_factor}/20</span>
+                      <span className="font-mono text-purple-300">
+                        {factors.compound_cluster_factor}/20
+                      </span>
                     </div>
                     <div className="mt-2 h-1.5 w-full rounded-full bg-slate-800 overflow-hidden">
                       <div
                         className="h-full bg-purple-500 rounded-full"
-                        style={{ width: `${(factors.compound_cluster_factor / 20) * 100}%` }}
+                        style={{
+                          width: `${(factors.compound_cluster_factor / 20) * 100}%`,
+                        }}
                       />
                     </div>
                   </div>
                 </div>
 
                 {/* Plain-English Reasoning Text */}
-                <p className="text-xs text-slate-300 bg-slate-950/60 rounded-xl p-3 border border-slate-800/80 font-mono leading-relaxed">
+                <p className="text-xs text-slate-200 bg-slate-950/60 rounded-xl p-3 border border-slate-800/80 font-mono leading-relaxed">
                   {report.ai_reasoning}
                 </p>
 
                 {/* Duplicate Detection & Merge UI */}
                 {report.duplicate_of && (
-                  <div className="rounded-xl border border-amber-500/40 bg-amber-950/20 p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div
+                    role="status"
+                    aria-live="polite"
+                    className="rounded-xl border border-amber-500/40 bg-amber-950/20 p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                  >
                     <div className="space-y-1 text-xs">
                       <div className="font-bold text-amber-200 flex items-center gap-2">
-                        <GitMerge className="h-4 w-4 text-amber-400" />
-                        Semantic & Spatial Duplicate of Report #{report.duplicate_of.slice(-6)}
+                        <GitMerge
+                          className="h-4 w-4 text-amber-400"
+                          aria-hidden="true"
+                        />
+                        Semantic & Spatial Duplicate of Report #
+                        {report.duplicate_of.slice(-6)}
                         {parentReport && (
                           <span className="text-amber-300/90 font-normal">
-                            (“{parentReport.title}” — Score {parentReport.ai_priority_score}/100)
+                            (“{parentReport.title}” — Score{' '}
+                            {parentReport.ai_priority_score}/100)
                           </span>
                         )}
                       </div>
-                      <p className="text-amber-100/80">
+                      <p className="text-amber-100/90">
                         Haversine GPS Distance: <strong>{distMeters}m</strong> (&lt;250m threshold) • Cosine Similarity:{' '}
-                        <strong>{Math.round((report.similarity_score || 0.83) * 100)}%</strong>. Confirming merge links citizen tracking to the parent ticket and boosts parent priority score.
+                        <strong>
+                          {Math.round((report.similarity_score || 0.83) * 100)}%
+                        </strong>
+                        . Confirming merge links citizen tracking to the parent ticket and boosts parent priority score.
                       </p>
                     </div>
 
                     <div className="flex items-center gap-2 shrink-0">
                       <button
                         type="button"
+                        aria-label={`Jump to parent report ${report.duplicate_of.slice(-6)}`}
                         onClick={() => scrollToReportCard(report.duplicate_of!)}
                         className="inline-flex items-center gap-1 rounded-xl border border-amber-500/40 bg-slate-950 px-3 py-2 text-xs font-semibold text-amber-200 hover:bg-amber-950/60 transition"
                       >
-                        <ExternalLink className="h-3.5 w-3.5" />
+                        <ExternalLink
+                          className="h-3.5 w-3.5"
+                          aria-hidden="true"
+                        />
                         Jump to Parent
                       </button>
 
                       {isMerged ? (
                         <span className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-500/20 border border-emerald-500/40 px-3.5 py-2 text-xs font-bold text-emerald-300">
-                          <CheckCircle2 className="h-4 w-4" />
+                          <CheckCircle2
+                            className="h-4 w-4"
+                            aria-hidden="true"
+                          />
                           Merged & Parent Boosted!
                         </span>
                       ) : (
                         <button
                           type="button"
                           disabled={mergingId === report.id}
+                          aria-label={`Confirm merge of duplicate report ${report.id.slice(-4)} into parent report`}
                           onClick={() => handleConfirmMergeAndBoost(report)}
                           className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-3.5 py-2 text-xs font-bold text-slate-950 hover:bg-amber-400 transition shadow-md"
                         >
-                          <GitMerge className="h-4 w-4" />
+                          <GitMerge className="h-4 w-4" aria-hidden="true" />
                           {mergingId === report.id
                             ? 'Merging & Boosting...'
                             : 'Merge / Link Duplicate (+Boost Parent)'}
@@ -462,11 +575,10 @@ export const UnderstandTab: React.FC<UnderstandTabProps> = ({
                   </div>
                 )}
               </div>
-            </div>
+            </article>
           );
         })}
       </div>
-    </div>
+    </section>
   );
 };
-

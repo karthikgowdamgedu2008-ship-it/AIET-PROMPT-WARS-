@@ -1,6 +1,11 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import { ApiConfig, CivicReport } from '../types';
+import { ApiConfig, CivicReport } from '../types/civic';
 import { INITIAL_SYNTHETIC_REPORTS } from '../data/syntheticReports';
+import {
+  sanitizeInput,
+  validateCoordinates,
+  validateImageUrl,
+} from '../utils/security';
 
 const STORAGE_CONFIG_KEY = 'civicpulse_api_config_v1';
 const STORAGE_REPORTS_KEY = 'civicpulse_local_reports_v1';
@@ -13,7 +18,7 @@ export function getStoredConfig(): ApiConfig {
   try {
     const raw = localStorage.getItem(STORAGE_CONFIG_KEY);
     if (raw) {
-      const parsed = JSON.parse(raw);
+      const parsed = JSON.parse(raw) as Partial<ApiConfig>;
       return {
         supabaseUrl: parsed.supabaseUrl || envSupabaseUrl,
         supabaseAnonKey: parsed.supabaseAnonKey || envSupabaseAnonKey,
@@ -43,7 +48,10 @@ export function getSupabaseClient(config?: ApiConfig): SupabaseClient | null {
     active.supabaseUrl.startsWith('http')
   ) {
     try {
-      return createClient(active.supabaseUrl.trim(), active.supabaseAnonKey.trim());
+      return createClient(
+        active.supabaseUrl.trim(),
+        active.supabaseAnonKey.trim()
+      );
     } catch (e) {
       console.error('Invalid Supabase URL or Key:', e);
       return null;
@@ -56,7 +64,7 @@ export function getLocalCacheReports(): CivicReport[] {
   try {
     const raw = localStorage.getItem(STORAGE_REPORTS_KEY);
     if (raw) {
-      const parsed = JSON.parse(raw);
+      const parsed = JSON.parse(raw) as CivicReport[];
       if (Array.isArray(parsed) && parsed.length > 0) {
         return parsed;
       }
@@ -64,7 +72,10 @@ export function getLocalCacheReports(): CivicReport[] {
   } catch (e) {
     console.warn('Error reading local reports cache:', e);
   }
-  localStorage.setItem(STORAGE_REPORTS_KEY, JSON.stringify(INITIAL_SYNTHETIC_REPORTS));
+  localStorage.setItem(
+    STORAGE_REPORTS_KEY,
+    JSON.stringify(INITIAL_SYNTHETIC_REPORTS)
+  );
   return [...INITIAL_SYNTHETIC_REPORTS];
 }
 
@@ -100,17 +111,38 @@ const DB_COLUMNS = [
   'resolution_notes',
 ];
 
-function sanitizeForSupabase(report: Partial<CivicReport>): Record<string, unknown> {
+function sanitizeForSupabase(
+  report: Partial<CivicReport>
+): Record<string, unknown> {
   const clean: Record<string, unknown> = {};
   for (const key of DB_COLUMNS) {
     if (key in report && report[key as keyof CivicReport] !== undefined) {
-      clean[key] = report[key as keyof CivicReport];
+      const val = report[key as keyof CivicReport];
+      if (typeof val === 'string' && key !== 'image_url') {
+        clean[key] = sanitizeInput(val, 2000);
+      } else if (key === 'image_url') {
+        clean[key] = validateImageUrl(val as string | null);
+      } else {
+        clean[key] = val;
+      }
     }
   }
+
+  if (
+    typeof report.latitude === 'number' &&
+    typeof report.longitude === 'number'
+  ) {
+    const coords = validateCoordinates(report.latitude, report.longitude);
+    clean.latitude = coords.latitude;
+    clean.longitude = coords.longitude;
+  }
+
   return clean;
 }
 
-export async function fetchAllReports(config?: ApiConfig): Promise<FetchReportsResponse> {
+export async function fetchAllReports(
+  config?: ApiConfig
+): Promise<FetchReportsResponse> {
   const client = getSupabaseClient(config);
   if (!client) {
     return {
@@ -134,8 +166,9 @@ export async function fetchAllReports(config?: ApiConfig): Promise<FetchReportsR
     }
 
     if (!data || data.length === 0) {
-      // Automatically seed the empty public.reports table with our 30 baseline reports
-      const seedPayload = INITIAL_SYNTHETIC_REPORTS.map((r) => sanitizeForSupabase(r));
+      const seedPayload = INITIAL_SYNTHETIC_REPORTS.map((r) =>
+        sanitizeForSupabase(r)
+      );
       const { data: seededData, error: seedError } = await client
         .from('reports')
         .upsert(seedPayload, { onConflict: 'id' })
@@ -159,11 +192,13 @@ export async function fetchAllReports(config?: ApiConfig): Promise<FetchReportsR
       reports: data as CivicReport[],
       mode: 'live-supabase',
     };
-  } catch (err: any) {
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error ? err.message : 'Network error connecting to Supabase';
     return {
       reports: getLocalCacheReports(),
       mode: 'local-mirrored',
-      error: err?.message || 'Network error connecting to Supabase',
+      error: message,
     };
   }
 }
@@ -171,19 +206,30 @@ export async function fetchAllReports(config?: ApiConfig): Promise<FetchReportsR
 export async function insertReport(
   newReport: CivicReport,
   config?: ApiConfig
-): Promise<{ report: CivicReport; persistedToSupabase: boolean; error?: string }> {
-  // Always update local cache immediately for instant UI responsiveness
+): Promise<{
+  report: CivicReport;
+  persistedToSupabase: boolean;
+  error?: string;
+}> {
+  const sanitizedReport: CivicReport = {
+    ...newReport,
+    title: sanitizeInput(newReport.title, 200),
+    description: sanitizeInput(newReport.description, 2000),
+    address: sanitizeInput(newReport.address, 400),
+    image_url: validateImageUrl(newReport.image_url),
+  };
+
   const currentLocal = getLocalCacheReports();
-  const updatedLocal = [newReport, ...currentLocal];
+  const updatedLocal = [sanitizedReport, ...currentLocal];
   saveLocalCacheReports(updatedLocal);
 
   const client = getSupabaseClient(config);
   if (!client) {
-    return { report: newReport, persistedToSupabase: false };
+    return { report: sanitizedReport, persistedToSupabase: false };
   }
 
   try {
-    const dbRow = sanitizeForSupabase(newReport);
+    const dbRow = sanitizeForSupabase(sanitizedReport);
     const { data, error } = await client
       .from('reports')
       .insert([dbRow])
@@ -192,7 +238,7 @@ export async function insertReport(
 
     if (error) {
       return {
-        report: newReport,
+        report: sanitizedReport,
         persistedToSupabase: false,
         error: error.message,
       };
@@ -200,20 +246,24 @@ export async function insertReport(
 
     const savedReport: CivicReport = {
       ...(data as CivicReport),
-      triage_source: newReport.triage_source,
-      similarity_score: newReport.similarity_score,
-      distance_to_duplicate_m: newReport.distance_to_duplicate_m,
+      triage_source: sanitizedReport.triage_source,
+      similarity_score: sanitizedReport.similarity_score,
+      distance_to_duplicate_m: sanitizedReport.distance_to_duplicate_m,
     };
 
-    const syncedLocal = updatedLocal.map((r) => (r.id === newReport.id ? savedReport : r));
+    const syncedLocal = updatedLocal.map((r) =>
+      r.id === sanitizedReport.id ? savedReport : r
+    );
     saveLocalCacheReports(syncedLocal);
 
     return { report: savedReport, persistedToSupabase: true };
-  } catch (err: any) {
+  } catch (err: unknown) {
+    const message =
+      err instanceof Error ? err.message : 'Supabase insert error';
     return {
-      report: newReport,
+      report: sanitizedReport,
       persistedToSupabase: false,
-      error: err?.message || 'Supabase insert error',
+      error: message,
     };
   }
 }
@@ -223,8 +273,24 @@ export async function updateReportInDb(
   updates: Partial<CivicReport>,
   config?: ApiConfig
 ): Promise<{ persistedToSupabase: boolean; error?: string }> {
+  const cleanUpdates: Partial<CivicReport> = { ...updates };
+  if (typeof cleanUpdates.resolution_notes === 'string') {
+    cleanUpdates.resolution_notes = sanitizeInput(
+      cleanUpdates.resolution_notes,
+      1000
+    );
+  }
+  if (typeof cleanUpdates.assigned_department === 'string') {
+    cleanUpdates.assigned_department = sanitizeInput(
+      cleanUpdates.assigned_department,
+      200
+    );
+  }
+
   const currentLocal = getLocalCacheReports();
-  const updatedLocal = currentLocal.map((r) => (r.id === id ? { ...r, ...updates } : r));
+  const updatedLocal = currentLocal.map((r) =>
+    r.id === id ? { ...r, ...cleanUpdates } : r
+  );
   saveLocalCacheReports(updatedLocal);
 
   const client = getSupabaseClient(config);
@@ -233,28 +299,37 @@ export async function updateReportInDb(
   }
 
   try {
-    const dbUpdates = sanitizeForSupabase(updates);
+    const dbUpdates = sanitizeForSupabase(cleanUpdates);
     const { error } = await client.from('reports').update(dbUpdates).eq('id', id);
     if (error) {
       return { persistedToSupabase: false, error: error.message };
     }
     return { persistedToSupabase: true };
-  } catch (err: any) {
-    return { persistedToSupabase: false, error: err?.message };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Update error';
+    return { persistedToSupabase: false, error: message };
   }
 }
 
 export async function resetOrSeedBaselineDataset(
   config?: ApiConfig
-): Promise<{ reports: CivicReport[]; mode: 'live-supabase' | 'local-mirrored' }> {
+): Promise<{
+  reports: CivicReport[];
+  mode: 'live-supabase' | 'local-mirrored';
+}> {
   saveLocalCacheReports([...INITIAL_SYNTHETIC_REPORTS]);
   const client = getSupabaseClient(config);
   if (!client) {
-    return { reports: [...INITIAL_SYNTHETIC_REPORTS], mode: 'local-mirrored' };
+    return {
+      reports: [...INITIAL_SYNTHETIC_REPORTS],
+      mode: 'local-mirrored',
+    };
   }
 
   try {
-    const seedPayload = INITIAL_SYNTHETIC_REPORTS.map((r) => sanitizeForSupabase(r));
+    const seedPayload = INITIAL_SYNTHETIC_REPORTS.map((r) =>
+      sanitizeForSupabase(r)
+    );
     const { data, error } = await client
       .from('reports')
       .upsert(seedPayload, { onConflict: 'id' })
@@ -266,6 +341,8 @@ export async function resetOrSeedBaselineDataset(
   } catch (e) {
     console.warn('Reset seed fallback to local:', e);
   }
-  return { reports: [...INITIAL_SYNTHETIC_REPORTS], mode: 'local-mirrored' };
+  return {
+    reports: [...INITIAL_SYNTHETIC_REPORTS],
+    mode: 'local-mirrored',
+  };
 }
-
